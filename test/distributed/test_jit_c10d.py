@@ -7,7 +7,8 @@ from typing import List
 
 import torch.testing._internal.common_utils as common
 from torch.testing._internal.common_distributed import requires_nccl, skip_if_rocm_single_process
-from torch.testing._internal.common_utils import TestCase, load_tests, TEST_WITH_TSAN
+from torch.testing._internal.common_utils import load_tests, TEST_WITH_TSAN, run_tests
+from torch.testing._internal.jit_utils import JitTestCase
 
 # load_tests from common_utils is used to automatically filter tests for
 # sharding on sandcastle. This line silences flake warnings
@@ -27,7 +28,7 @@ else:
     TEST_WITH_TSAN,
     "TSAN is not fork-safe since we're forking in a multi-threaded environment",
 )
-class ProcessGroupNCCLJitTest(TestCase):
+class ProcessGroupNCCLJitTest(JitTestCase):
     MAIN_PROCESS_RANK = 0
 
     def setUp(self):
@@ -46,13 +47,13 @@ class ProcessGroupNCCLJitTest(TestCase):
 
         return torch.classes.dist_c10d.ProcessGroupNCCL(tcp_store, self.rank, self.world_size, opts)  
 
-    def _create_nccl_pg_as_base_process_group(self):
+    def _create_nccl_pg_as_base_process_group(self, name):
         addr = "localhost"
         port = common.find_free_port()
         tcp_store = torch.classes.dist_c10d.TCPStore(addr, port, 1, True)
 
-        return torch.classes.c10d.frontend().newProcessGroupHelper(
-            self.world_size, self.rank, [], "NCCL", tcp_store, "test_process_group", 0)
+        return torch.classes.dist_c10d.frontend().new_process_group_helper(
+            self.world_size, self.rank, [], "NCCL", tcp_store, name, 0)
 
     @requires_nccl()
     @skip_if_rocm_single_process
@@ -84,12 +85,12 @@ class ProcessGroupNCCLJitTest(TestCase):
     @requires_nccl()
     @skip_if_rocm_single_process
     def test_init_process_group_nccl_as_base_process_group_torchbind(self):
-        self._create_nccl_pg_as_base_process_group()
+        self._create_nccl_pg_as_base_process_group("creation_test_process_group")
 
     @requires_nccl()
     @skip_if_rocm_single_process
     def test_process_group_nccl_as_base_process_group_torchbind_alltoall(self):
-        nccl_pg = self._create_nccl_pg_as_base_process_group()
+        nccl_pg = self._create_nccl_pg_as_base_process_group("alltoall_test_process_group")
 
         input = torch.rand(16).cuda()
         output = torch.rand(16).cuda()
@@ -107,3 +108,74 @@ class ProcessGroupNCCLJitTest(TestCase):
             return work.result()
 
         run_pg_nccl_alltoall(nccl_pg, output, input)
+
+    def test_process_group_nccl_serialization(self):
+        class TestModule(torch.nn.Module):
+            def __init__(self):
+                super(TestModule, self).__init__()
+                self.pg = self._create_nccl_pg()
+
+            def forward(self, input: torch.Tensor):
+                if self.pg is None:
+                    return input + 1
+                else:
+                    return input + 2
+
+        self.checkModule(TestModule, torch.rand((2, 3)))
+
+
+class C10dFrontendJitTest(JitTestCase):
+    def setUp(self):
+        self.rank = self.MAIN_PROCESS_RANK
+        self.world_size = 1
+        self.file = tempfile.NamedTemporaryFile(delete=False)
+        self.num_gpus = torch.cuda.device_count()
+        if self.num_gpus < 2:
+            raise unittest.SkipTest("NCCL test requires 2+ GPUs")
+
+    def test_frontend_singleton(self):
+        frontend1 = torch.classes.dist_c10d.frontend()
+        frontend2 = torch.classes.dist_c10d.frontend()
+
+        addr = "localhost"
+        port = common.find_free_port()
+        tcp_store = torch.classes.dist_c10d.TCPStore(addr, port, 1, True)
+
+        ProcessGroupNCCL1 = frontend1.new_process_group_helper(
+            self.world_size, self.rank, [], "NCCL", tcp_store, "singleton_test_process_group", 0)
+
+        ProcessGroupNCCL2 = frontend2.get_process_group_by_name("singleton_test_process_group")
+        self.assertEqual(ProcessGroupNCCL1, ProcessGroupNCCL2)
+
+class C10dProcessGroupSerialization(JitTestCase):
+    def test_process_group_as_module_member(self):
+
+        def setUp(self):
+            self.rank = self.MAIN_PROCESS_RANK
+            self.world_size = 1
+            self.file = tempfile.NamedTemporaryFile(delete=False)
+            self.num_gpus = torch.cuda.device_count()
+            if self.num_gpus < 2:
+                raise unittest.SkipTest("NCCL test requires 2+ GPUs")
+
+        class TestModule(torch.nn.Module):
+            def __init__(self):
+                super(TestModule, self).__init__()
+                addr = "localhost"
+                port = common.find_free_port()
+                tcp_store = torch.classes.dist_c10d.TCPStore(addr, port, 1, True)
+
+                self.pg = torch.classes.dist_c10d.frontend().new_process_group_helper(
+                    self.world_size, self.rank, [], "NCCL", tcp_store, "module_member_process_group", 0)
+
+            def forward(self, input: torch.Tensor):
+                if self.pg is None:
+                    return input + 1
+                else:
+                    return input + 2
+
+        self.checkModule(TestModule(), torch.rand((2, 3)))
+
+
+if __name__ == "__main__":
+    run_tests()
